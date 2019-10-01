@@ -7,7 +7,14 @@ case class Team(players: Seq[Player], points: Set[HalfSuit])
 // players should be sorted with most recent player as the head
 
 object FishGame {
-  def createRandom(team1players: Seq[Player], team2players: Seq[Player]): FishGame = {
+  def random(players: Seq[Player]): FishGame = {
+    val randomized = Random.shuffle(players)
+    val (team1, team2) = randomized.splitAt(randomized.size / 2)
+
+    randomHands(team1, team2)
+  }
+
+  def randomHands(team1players: Seq[Player], team2players: Seq[Player]): FishGame = {
     val deck = Random.shuffle(Card.values)
 
     val jumbledPlayers = Random.shuffle(team1players ++ team2players)
@@ -16,20 +23,40 @@ object FishGame {
       Iterator.continually(jumbledPlayers).flatten
     ).toMap
 
-    val team1 = Team(Random.shuffle(team1players), Set.empty)
-    val team2 = Team(Random.shuffle(team2players), Set.empty)
-
-    FishGame(team1, team2, hands)
+    FishGame(Team(team1players, Set.empty), Team(team2players, Set.empty), hands)
   }
 }
 case class FishGame(currTeam: Team, oppTeam: Team, hands: Map[Card, Player]) {
   import fishbot.FishException._
 
+  def winner: Option[Team] =
+    if (currTeam.points.size > 4)
+      Some(currTeam)
+    else if (oppTeam.points.size > 4)
+      Some(oppTeam)
+    else None
+
+  private def playerHasCards(player: Player): Boolean = hands.values.exists(_ == player)
   private def playerHasHalfsuit(player: Player, halfSuit: HalfSuit): Boolean =
     hands.exists { case (c, p) => c.halfSuit == halfSuit && p == player }
 
+  def currPlayer: Player = currTeam.players.head
   private def onCurrTeam(player: Player): Boolean = currTeam.players.contains(player)
-  private def currPlayer: Player = currTeam.players.head
+
+  // Ensures currPlayer has cards unless nobody has cards
+  private def fixCurrPlayer: FishGame = {
+    def bubbleUp(team: Team): Team =
+      team.copy(players = team.players.
+        foldRight(Seq.empty[Player]) { case (p, seq) =>
+          if (playerHasCards(p)) p +: seq
+          else seq :+ p
+        })
+
+    if (currTeam.players.exists(playerHasCards))
+      FishGame(bubbleUp(currTeam), oppTeam, hands)
+    else
+      FishGame(bubbleUp(oppTeam), currTeam, hands)
+  }
 
   def requestCard(target: Player, card: Card): Either[InvalidRequest, FishGame] =
     if (onCurrTeam(target))
@@ -46,81 +73,75 @@ case class FishGame(currTeam: Team, oppTeam: Team, hands: Map[Card, Player]) {
           if (p == target)
             FishGame(
               currTeam, oppTeam, hands.updated(card, currPlayer)
-            )
+            ).fixCurrPlayer
           else
             FishGame(
-              Team(target +: oppTeam.players.filter(_ != target), oppTeam.points),
+              oppTeam.copy(players = target +: oppTeam.players.filter(_ != target)),
               currTeam,
               hands
-            )
+            ).fixCurrPlayer
         )
     }
 
-  private def winHalfSuit(halfSuit: HalfSuit): FishGame = {
-    val newHand = hands.filter(_._1.halfSuit != halfSuit)
-
-    FishGame(
-      Team(
-        currTeam.players.filter(p => newHand.values.exists(_ == p)),
-        currTeam.points + halfSuit),
-      Team(
-        oppTeam.players.filter(p => newHand.values.exists(_ == p)),
-        oppTeam.points),
-      newHand
-    )
-  }
-
-  private def loseHalfSuit(halfSuit: HalfSuit): FishGame = {
-    val newHand = hands.filter(_._1.halfSuit != halfSuit)
-
-    FishGame(
-      Team(
-        currTeam.players.filter(p => newHand.values.exists(_ == p)),
-        currTeam.points),
-      Team(
-        oppTeam.players.filter(p => newHand.values.exists(_ == p)),
-        oppTeam.points + halfSuit),
-      newHand
-    )
-  }
-
-  def callHalfsuit(halfSuit: HalfSuit, locations: Map[Card, Player]): Either[(InvalidCall, FishGame), FishGame] =
+  def callHalfsuit(halfSuit: HalfSuit, locations: Map[Card, Player]): Either[InvalidCall, Either[(WrongCall, FishGame), FishGame]] =
     if (locations.keySet != Card.halfSuitSet(halfSuit))
-      Left((MissingCard, loseHalfSuit(halfSuit)))
-    else {
-      val diff = locations.filter(_._1.halfSuit == halfSuit).toSet -- locations
+      Left(NotHalfSuit)
+    else if (!playerHasHalfsuit(currPlayer, halfSuit))
+      Left(NoCardInHalfsuit)
+    else Right({
+      val diff = hands.filter(_._1.halfSuit == halfSuit).toSet -- locations
+      val newHands = hands.filter(_._1.halfSuit != halfSuit)
 
-      if (diff.nonEmpty)
-        Left((WrongCall(diff.toMap), loseHalfSuit(halfSuit)))
-      else
-        Right(winHalfSuit(halfSuit))
-    }
+      if (diff.nonEmpty) Left((WrongCall(diff.toMap),
+        FishGame(
+          oppTeam.copy(points = oppTeam.points + halfSuit),
+          currTeam, newHands
+        ).fixCurrPlayer
+      )) else Right(
+        FishGame(
+          currTeam.copy(points = currTeam.points + halfSuit),
+          oppTeam, newHands
+        ).fixCurrPlayer
+      )
+    })
 }
 
-sealed trait FishException extends Exception
+sealed abstract class FishException(msg: String) extends Exception(msg)
 object FishException {
-  case object GameFinished    extends FishException
-  case object NoPlayers       extends FishException
+  case object GameFinished     extends FishException("Game has finished!")
+  case object NoPlayers        extends FishException("There are no players!")
 
-  sealed trait InvalidRequest extends FishException
-  sealed trait InvalidCall    extends FishException
+  sealed trait InvalidRequest  extends FishException
 
-  case object NoCardInHalfsuit extends InvalidRequest with InvalidCall
+  case object AlreadyHasCard   extends FishException("Player already has this card!")
+                                  with InvalidRequest
+  case object CardOutOfPlay    extends FishException("Card is no longer in play.")
+                                  with InvalidRequest
+  case object TargetOnTeam     extends FishException("Cannot request cards from a player on the same team!")
+                                  with InvalidRequest
+  case object TargetOutOfPlay  extends FishException("Target does not have any cards!")
+                                  with InvalidRequest
 
-  case object AlreadyHasCard extends InvalidRequest
-  case object CardOutOfPlay  extends InvalidRequest
-  case object TargetOnTeam   extends InvalidRequest
+  sealed trait InvalidCall     extends FishException
 
-  case object MissingCard extends InvalidCall
-  case class WrongCall(incorrect: Map[Card, Player]) extends InvalidCall
+  case object NotHalfSuit      extends FishException("Call did not specify exactly every card in the half-suit!")
+                                  with InvalidCall
+
+  case class WrongCall(incorrect: Map[Card, Player])
+                               extends FishException("Call was incorrect about position of one or more cards in the half suit!")
+
+  case object NoCardInHalfsuit extends FishException("Player does not have any cards in that half suit!")
+                                  with InvalidRequest with InvalidCall
 }
 
-sealed trait HalfSuit
+sealed trait HalfSuit extends Product
 object HalfSuit {
   val values: Set[HalfSuit] = Set(
     LowSpades, HighSpades, LowHearts, HighHearts,
     LowClubs, HighClubs, LowDiamonds, HighDiamonds, EightsJokers
   )
+
+  def byName(name: String): Option[HalfSuit] = values.find(_.productPrefix == name)
 
   case object LowSpades    extends HalfSuit
   case object HighSpades   extends HalfSuit
@@ -133,17 +154,19 @@ object HalfSuit {
   case object EightsJokers extends HalfSuit
 }
 
-sealed class Card (val halfSuit: HalfSuit)
+sealed abstract class Card (val halfSuit: HalfSuit) extends Product
 object Card {
   import HalfSuit._
 
-  def values: Set[Card] = Set(
+  val values: Set[Card] = Set(
     S2, S3, S4, S5, S6, S7, S8, S9, SX, SJ, SQ, SK, SA,
     H2, H3, H4, H5, H6, H7, H8, H9, HX, HJ, HQ, HK, HA,
     C2, C3, C4, C5, C6, C7, C8, C9, CX, CJ, CQ, CK, CA,
     D2, D3, D4, D5, D6, D7, D8, D9, DX, DJ, DQ, DK, DA,
     RedJoker, BlackJoker
   )
+
+  def byName(name: String): Option[Card] = values.find(_.productPrefix == name)
 
   def halfSuitSet(halfSuit: HalfSuit): Set[Card] = values.filter(_.halfSuit == halfSuit)
 
